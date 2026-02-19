@@ -17,6 +17,7 @@ from einops import rearrange
 class OpGISTLoadImage(OpBase):
     """
     Load a NIfTI image file (.nii.gz) from a given directory and convert it to [Z, Y, X] format.
+    Also swaps axes so that the shortest dimension is last.
     Stores the image array, original spacing, and original size in sample_dict.
 
     - key_in: str → filename key (e.g., 'file.nii.gz')
@@ -26,6 +27,42 @@ class OpGISTLoadImage(OpBase):
     def __init__(self, dir_path: str):
         super().__init__()
         self._dir_path = dir_path
+
+    def _swap_axes_to_standard(
+        self, 
+        data: np.ndarray, 
+        spacing: np.ndarray, 
+    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """Swap axes so shortest dimension is last"""
+        if len(data.shape) != 3:
+            return data, spacing, {'swapped': False}
+        
+        original_shape = data.shape
+        min_axis = np.argmin(original_shape)
+        
+        # If already correct, return as is
+        if min_axis == 2:
+            return data, spacing, {'swapped': False, 'reason': 'already_standard'}
+        
+        # Determine new axis order: move min_axis to last position
+        axes_order = [0, 1, 2]
+        axes_order.remove(min_axis)
+        axes_order.append(min_axis)
+        
+        # Swap data and spacing
+        data_swapped = np.transpose(data, axes_order)
+        spacing_swapped = np.array([spacing[i] for i in axes_order])
+        
+        swap_info = {
+            'swapped': True,
+            'original_axes': [0, 1, 2],
+            'new_axes': axes_order,
+            'min_axis': min_axis,
+            'original_shape': original_shape,
+            'new_shape': data_swapped.shape
+        }
+        
+        return data_swapped, spacing_swapped, swap_info
 
     def __call__(self, sample_dict: NDict, key_in: str, key_out: str) -> NDict:
         img_filename = os.path.join(self._dir_path, sample_dict[key_in])
@@ -45,9 +82,14 @@ class OpGISTLoadImage(OpBase):
         original_spacing = np.array(spacing_xyz[::-1], dtype=np.float32)  # [Z, Y, X]
         original_size = np.array(img_np.shape, dtype=np.int32)            # [Z, Y, X]
 
+        # --- Swap axes so shortest dimension is last ---
+        img_np, spacing_swapped, swap_info = self._swap_axes_to_standard(img_np, original_spacing)
+
         # --- Save into sample_dict ---
         sample_dict[key_out] = img_np.copy()
-        sample_dict["data.input.img.original_spacing"] = original_spacing
+        sample_dict["data.input.img.original_spacing"] = spacing_swapped
+        sample_dict["data.input.img.original_size"] = np.array(img_np.shape, dtype=np.int32)
+        sample_dict[f"{key_out}.swap_info"] = swap_info
         sample_dict["data.input.img.original_size"] = original_size
 
         return sample_dict
