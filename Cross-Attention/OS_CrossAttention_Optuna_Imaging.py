@@ -276,24 +276,72 @@ def build_model(
     )
     return model
 class SimpleLossPlotCallback(Callback):
-    """Lightweight callback for real-time loss plotting"""
+    """Lightweight callback for real-time loss plotting.
+
+    Captures losses directly from trainer.callback_metrics to avoid CSV flush
+    timing issues (the CSVLogger may not have written the current epoch's
+    training rows to disk yet when on_validation_end fires).
+    """
     def __init__(self, save_every_n_epochs: int = 5):
         super().__init__()
         self.save_every_n_epochs = save_every_n_epochs
-    
+        self._train_losses: dict = {}  # epoch -> loss
+        self._val_losses: dict = {}    # epoch -> loss
+
+    def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        epoch = trainer.current_epoch
+        metrics = trainer.callback_metrics
+        if 'train.losses.total_loss' in metrics:
+            self._train_losses[epoch] = float(metrics['train.losses.total_loss'])
+
+    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        epoch = trainer.current_epoch
+        metrics = trainer.callback_metrics
+        if 'validation.losses.total_loss' in metrics:
+            self._val_losses[epoch] = float(metrics['validation.losses.total_loss'])
+
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        """Plot simple loss curves periodically"""
         current_epoch = trainer.current_epoch
-        
         if (current_epoch + 1) % self.save_every_n_epochs == 0:
             try:
                 log_dir = trainer.log_dir if hasattr(trainer, 'log_dir') else trainer.default_root_dir
                 if log_dir:
-                    # Create a simple real-time plot
-                    create_simple_realtime_plot(log_dir, current_epoch)
-            except Exception as e:
-                # Don't interrupt training for plotting
+                    self._plot(log_dir, current_epoch)
+            except Exception:
                 pass
+
+    def _plot(self, log_dir: str, current_epoch: int) -> None:
+        try:
+            plt.figure(figsize=(12, 7))
+
+            if self._train_losses:
+                epochs = sorted(self._train_losses)
+                losses = [self._train_losses[e] for e in epochs]
+                plt.plot(epochs, losses, label='Training Loss',
+                         linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
+                print(f"[PLOT] Training losses plotted: {len(epochs)} epochs")
+
+            if self._val_losses:
+                epochs = sorted(self._val_losses)
+                losses = [self._val_losses[e] for e in epochs]
+                plt.plot(epochs, losses, label='Validation Loss',
+                         linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
+                print(f"[PLOT] Validation losses plotted: {len(epochs)} epochs")
+
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.title(f'Loss Curves (Updated at Epoch {current_epoch})', fontsize=14)
+            plt.legend(fontsize=11, loc='best')
+            plt.grid(True, alpha=0.3)
+
+            plot_path = os.path.join(log_dir, "loss_curves_realtime.png")
+            plt.savefig(plot_path, dpi=120, bbox_inches='tight')
+            plt.close()
+            print(f"[PLOT] Saved plot to {plot_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to create realtime plot: {e}")
+            import traceback
+            traceback.print_exc()
 
 def create_simple_realtime_plot(log_dir: str, current_epoch: int):
     """Create a simple plot during training - plots all epochs up to current"""
