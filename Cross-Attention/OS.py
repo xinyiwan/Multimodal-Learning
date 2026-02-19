@@ -7,7 +7,8 @@ from fuse.data.ops.ops_common import OpKeepKeypaths
 from typing import Optional, Sequence, Tuple, List
 import pandas as pd
 import os
-
+import torch
+import matplotlib.pyplot as plt
 
 from GISTDataUtils import (
     OpGISTLoadImage, OpCastLabelToFloat, OpGISTResample, OpTumorCrop,
@@ -41,9 +42,9 @@ class OSDataset:
     @staticmethod
     def setup_clinical_preprocessing(df_clinical: pd.DataFrame, sample_ids: List[str]):
         # Debug print to check what we're receiving
-        print(f"sample_ids type: {type(sample_ids)}")
-        print(f"sample_ids first few: {sample_ids[:5] if sample_ids else 'Empty list'}")
-        print(sample_ids)
+        # print(f"sample_ids type: {type(sample_ids)}")
+        # print(f"sample_ids first few: {sample_ids[:5] if sample_ids else 'Empty list'}")
+        # print(sample_ids)
         
         # Verify it's a list
         if not isinstance(sample_ids, list):
@@ -130,11 +131,13 @@ class OSDataset:
         steps = []
 
         # Resample
+        # Note: After axis swap in OpGISTLoadImage, images are in [Z, Y, X] format.
+        # OpGISTResample expects (target_spacing_z, target_spacing_y, target_spacing_x)
         steps.append((
             OpGISTResample(
-                target_spacing_x=0.5,
-                target_spacing_y=0.5,
-                target_spacing_z=5.0
+                target_spacing_z=3.0,
+                target_spacing_y=1.5,
+                target_spacing_x=1.5
             ), dict()
         ))
 
@@ -182,7 +185,7 @@ class OSDataset:
         steps.append((
             OpCTPatchifyWithMask(
                 patch_size=patch_size,
-                pad_val=-150.0,
+                pad_val=0.0,
                 mask_pad_threshold=mask_pad_threshold,  # <-- NEW param
             ),
             dict(
@@ -223,12 +226,17 @@ class OSDataset:
             "data.sample_id",
             # TODO: comment out Center for now, but need more changes to align with full codes
             # "data.input.clinical.raw.Center",
+            # "data.input.img",
+            # "data.input.seg",
+            # "data.input.img.b_swap",
+            # "data.input.seg.b_swap",
             "data.input.img_path",
             "data.input.seg_path",
             "data.input.clinical.vector",
             "model.embed_ids_a",
             "model.embed_mask_a",
-            "data.input.img.tumor3d",
+            # "data.input.img.tumor3d.fitted",
+            # "data.input.img.tumor3d",
             "data.input.img.tumor3d.patches",
             "model.embed_mask_b",
             "data.input.clinical.raw.Huvosnew",
@@ -297,42 +305,82 @@ class OSDataset:
 
 if __name__ == "__main__":
     
-    # modalities = ['T1W', 'T1W_FS_C', 'T2W_FS']
-    modalities = ['T2W_FS']
-    for modality in modalities:
+    modalities = ['T1W', 'T1W_FS_C', 'T2W_FS']
+    largest_tumor_sizes = [(53, 92, 95), (53, 93, 95), (47, 93, 106)]
+
+    for idx, modality in enumerate(modalities):
         data_dir = f'/projects/prjs1779/Osteosarcoma/exp_data/{modality}/v1/'
         data_dir_img = os.path.join(data_dir, "input", "img")
         data_dir_seg = os.path.join(data_dir, "input", "seg")
         clinical_csv_path = os.path.join(data_dir, "clinical_features_with_Huvos.csv")
         data_paths = {"img": data_dir_img, "seg": data_dir_seg, "csv": clinical_csv_path}
 
-        # use original value 
-        largest_tumor = (80, 347, 498)
+        # Print the largest size for this modality
+        print(f"Processing modality: {modality} with largest tumor size: {largest_tumor_sizes[idx]}")
 
         full_dataset = OSDataset.dataset(
             data_dir_img=data_paths["img"],
             data_dir_seg=data_paths["seg"],
             clinical_csv_path=data_paths["csv"],
             train=False,
-            # sample_ids=['OS_000095_02', 'OS_000114_01'],
+            # sample_ids=['OS_000095_01', 'OS_000114_01'],
             sample_ids=None,
             patch_size=(8, 64, 64),
-            largest_tumor=largest_tumor,
+            largest_tumor=largest_tumor_sizes[idx],
             angle_range=(0.0, 0.0),
             mask_pad_threshold=0.8,
             dropout_p=0.0,
         )
 
-        OSUtils = GISTDataUtils(dataset=full_dataset,
-                                img_dir=data_dir_img,
-                                seg_dir=data_dir_seg,
-                                modality=modality)
 
-        # 1. Get maximum tumor size
-        largest_tumor, tumor_stats = OSUtils.get_max_tumor_size()
+        # Create a DataLoader
+        dataloader = torch.utils.data.DataLoader(
+            full_dataset,
+            batch_size=1,  # Adjust batch size as needed
+            shuffle=True,  # Shuffle for training, False for validation
+            num_workers=0,  # Adjust based on your system
+            pin_memory=True  # Useful for GPU training
+        )
 
-        # 2. Get intensity range
-        (min_intensity, max_intensity), intensity_stats = OSUtils.get_intensity_range()
-        print(f"Global intensity range: [{min_intensity}, {max_intensity}]")
+
+        # OSUtils = GISTDataUtils(dataset=full_dataset,
+        #                         img_dir=data_dir_img,
+        #                         seg_dir=data_dir_seg,
+        #                         modality=modality)
+
+        # # 1. Get maximum tumor size
+        # largest_tumor, tumor_stats = OSUtils.get_max_tumor_size()
+
+        # # 2. Get intensity range
+        # (min_intensity, max_intensity), intensity_stats = OSUtils.get_intensity_range()
+        # print(f"Global intensity range: [{min_intensity}, {max_intensity}]")
 
         # 3. visualize the pacthes for each subject
+        for batch in dataloader:
+            print(f"Processing batch with sample IDs: {batch['data.sample_id']}")
+            # Visualize patches
+            keys = ['data.input.img.tumor3d.fitted', 'data.input.img.tumor3d', 'data.input.img']
+            for key in keys:
+                def quick_plot(batch, key):
+                    """
+                    Quick plot - just show the middle segmentation slice
+                    """
+                    # get pid
+                    pid = batch['data.sample_id'][0]
+                    # get category
+                    cat = key.split('.')[-1]
+                    # makedir 
+                    savedir = f'/projects/prjs1779/Osteosarcoma/ViT_OSdata/dataloader/{modality}/{cat}/'
+                    os.makedirs(savedir, exist_ok=True)
+
+                    data = batch[key][0]
+                    data = data.detach().cpu().numpy()
+                    
+                    # Get middle slice
+                    mid_slice = data[data.shape[0] // 2]
+                    
+                    # Simple plot
+                    plt.figure(figsize=(8, 8))
+                    plt.imshow(mid_slice, cmap='gray')
+                    plt.savefig(os.path.join(savedir, f'{pid}_mid_slice.png'))
+                quick_plot(batch, key=key)
