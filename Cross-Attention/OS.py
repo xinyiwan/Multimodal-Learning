@@ -355,32 +355,22 @@ if __name__ == "__main__":
         # (min_intensity, max_intensity), intensity_stats = OSUtils.get_intensity_range()
         # print(f"Global intensity range: [{min_intensity}, {max_intensity}]")
 
-        # 3. visualize the pacthes for each subject
+        # 3. visualize the patches for each subject
+        savedir = f'/projects/prjs1779/Osteosarcoma/ViT_OSdata/dataloader/{modality}/visualise'
+        os.makedirs(savedir, exist_ok=True)
         for batch in dataloader:
             print(f"Processing batch with sample IDs: {batch['data.sample_id']}")
-            # Visualize patches
+            pid = batch['data.sample_id'][0]
             keys = ['data.input.img.tumor3d.fitted', 'data.input.img.tumor3d', 'data.input.img']
-            for key in keys:
-                def quick_plot(batch, key):
-                    """
-                    Quick plot - just show the middle segmentation slice
-                    """
-                    # get pid
-                    pid = batch['data.sample_id'][0]
-                    # get category
-                    cat = key.split('.')[-1]
-                    # makedir 
-                    savedir = f'/projects/prjs1779/Osteosarcoma/ViT_OSdata/dataloader/{modality}/{cat}/'
-                    os.makedirs(savedir, exist_ok=True)
+            titles = ['fitted', 'tumor3d', 'img']
 
-                    data = batch[key][0]
-                    data = data.detach().cpu().numpy()
-                    
-                    # Get middle slice
-                    mid_slice = data[data.shape[0] // 2]
-                    
-                    # Simple plot
-                    plt.figure(figsize=(8, 8))
-                    plt.imshow(mid_slice, cmap='gray')
-                    plt.savefig(os.path.join(savedir, f'{pid}_mid_slice.png'))
-                quick_plot(batch, key=key)
+            fig, axes = plt.subplots(1, len(keys), figsize=(8 * len(keys), 8))
+            for ax, key, title in zip(axes, keys, titles):
+                data = batch[key][0].detach().cpu().numpy()
+                mid_slice = data[data.shape[0] // 2]
+                ax.imshow(mid_slice, cmap='gray')
+                ax.set_title(title)
+                ax.axis('off')
+            fig.suptitle(pid)
+            fig.savefig(os.path.join(savedir, f'{pid}_mid_slice.png'))
+            plt.close(fig)
