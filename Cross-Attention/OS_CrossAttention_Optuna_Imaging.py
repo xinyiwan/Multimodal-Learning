@@ -307,35 +307,37 @@ def create_simple_realtime_plot(log_dir: str, current_epoch: int):
                 # Filter to current epoch and earlier to ensure we have complete data
                 df = df[df['epoch'] <= current_epoch].copy()
                 
-                # Group by epoch and aggregate losses
-                # For training loss, take mean of all steps in that epoch (smoother)
-                # For validation loss, take last value (one per epoch)
-                df_grouped = df.groupby('epoch').agg({
-                    'train.losses.total_loss': 'last',  # mean of all training steps in epoch
-                    'validation.losses.total_loss': 'last'  # validation happens once per epoch
-                }).reset_index()
-                
-                print(f"[PLOT] Creating loss plot with {len(df_grouped)} epochs (current: {current_epoch})")
-                
+                # Aggregate each loss column independently after dropping its own NaNs.
+                # The last row per epoch is the validation row (NaN for train loss), so
+                # a combined groupby().agg('last') would zero-out training loss every epoch.
+                train_grouped = (
+                    df.dropna(subset=['train.losses.total_loss'])
+                    .groupby('epoch')['train.losses.total_loss']
+                    .mean()
+                    .reset_index()
+                )
+                val_grouped = (
+                    df.dropna(subset=['validation.losses.total_loss'])
+                    .groupby('epoch')['validation.losses.total_loss']
+                    .last()
+                    .reset_index()
+                )
+
+                print(f"[PLOT] Creating loss plot — train epochs: {len(train_grouped)}, val epochs: {len(val_grouped)} (current: {current_epoch})")
+
                 plt.figure(figsize=(12, 7))
-                
+
                 # Plot training loss
-                if 'train.losses.total_loss' in df_grouped.columns:
-                    train_loss = df_grouped['train.losses.total_loss'].dropna()
-                    if len(train_loss) > 0:
-                        epochs = df_grouped.loc[train_loss.index, 'epoch'].values
-                        plt.plot(epochs, train_loss.values, 
-                                label='Training Loss', linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
-                        print(f"[PLOT] Training losses plotted: {len(train_loss)} epochs")
-                
+                if len(train_grouped) > 0:
+                    plt.plot(train_grouped['epoch'], train_grouped['train.losses.total_loss'],
+                            label='Training Loss', linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
+                    print(f"[PLOT] Training losses plotted: {len(train_grouped)} epochs")
+
                 # Plot validation loss
-                if 'validation.losses.total_loss' in df_grouped.columns:
-                    val_loss = df_grouped['validation.losses.total_loss'].dropna()
-                    if len(val_loss) > 0:
-                        epochs = df_grouped.loc[val_loss.index, 'epoch'].values
-                        plt.plot(epochs, val_loss.values, 
-                                label='Validation Loss', linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
-                        print(f"[PLOT] Validation losses plotted: {len(val_loss)} epochs")
+                if len(val_grouped) > 0:
+                    plt.plot(val_grouped['epoch'], val_grouped['validation.losses.total_loss'],
+                            label='Validation Loss', linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
+                    print(f"[PLOT] Validation losses plotted: {len(val_grouped)} epochs")
                 
                 plt.xlabel('Epoch', fontsize=12)
                 plt.ylabel('Loss', fontsize=12)
