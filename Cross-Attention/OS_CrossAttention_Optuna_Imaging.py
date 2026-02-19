@@ -310,6 +310,15 @@ class SimpleLossPlotCallback(Callback):
             except Exception:
                 pass
 
+    def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        """Always save a final plot after training so all epochs are included."""
+        try:
+            log_dir = trainer.log_dir if hasattr(trainer, 'log_dir') else trainer.default_root_dir
+            if log_dir:
+                self._plot(log_dir, trainer.current_epoch)
+        except Exception:
+            pass
+
     def _plot(self, log_dir: str, current_epoch: int) -> None:
         try:
             plt.figure(figsize=(12, 7))
