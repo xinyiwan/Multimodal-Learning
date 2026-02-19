@@ -44,11 +44,16 @@ import pytorch_lightning as pl
 from fuse.dl.lightning.pl_module import LightningModuleDefault
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.callbacks import Callback
+import matplotlib.pyplot as plt
 
 from fuse.data.utils.collates import CollateDefault
+from fuse.data.utils.samplers import BatchSamplerDefault
+
 from OS import OSDataset
 from HeadMLPClassifier import HeadMLPClassifier
 from x_transformers import Encoder, TransformerWrapper
+from OSHelper import plot_loss_curves
 
 # =============================
 # Global constants
@@ -56,7 +61,6 @@ from x_transformers import Encoder, TransformerWrapper
 
 RUNS_DIR_NAME = "runs_optuna_os_imaging"
 
-OPTUNA_OUTPUT_DIR = "optuna_output_os_imaging"
 OPTUNA_STUDY_NAME = "os_imaging_optuna"
 
 KEY_PROB = "model.prob.NAC_Classification"
@@ -271,11 +275,87 @@ def build_model(
         ],
     )
     return model
+class SimpleLossPlotCallback(Callback):
+    """Lightweight callback for real-time loss plotting"""
+    def __init__(self, save_every_n_epochs: int = 5):
+        super().__init__()
+        self.save_every_n_epochs = save_every_n_epochs
+    
+    def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        """Plot simple loss curves periodically"""
+        current_epoch = trainer.current_epoch
+        
+        if (current_epoch + 1) % self.save_every_n_epochs == 0:
+            try:
+                log_dir = trainer.log_dir if hasattr(trainer, 'log_dir') else trainer.default_root_dir
+                if log_dir:
+                    # Create a simple real-time plot
+                    create_simple_realtime_plot(log_dir, current_epoch)
+            except Exception as e:
+                # Don't interrupt training for plotting
+                pass
+
+def create_simple_realtime_plot(log_dir: str, current_epoch: int):
+    """Create a simple plot during training - plots all epochs up to current"""
+    try:
+        metrics_path = os.path.join(log_dir, "metrics.csv")
+        if os.path.exists(metrics_path):
+            df = pd.read_csv(metrics_path)
+            
+            
+            if len(df) > 0:
+                # Filter to current epoch and earlier to ensure we have complete data
+                df = df[df['epoch'] <= current_epoch].copy()
+                
+                # Group by epoch and aggregate losses
+                # For training loss, take mean of all steps in that epoch (smoother)
+                # For validation loss, take last value (one per epoch)
+                df_grouped = df.groupby('epoch').agg({
+                    'train.losses.total_loss': 'last',  # mean of all training steps in epoch
+                    'validation.losses.total_loss': 'last'  # validation happens once per epoch
+                }).reset_index()
+                
+                print(f"[PLOT] Creating loss plot with {len(df_grouped)} epochs (current: {current_epoch})")
+                
+                plt.figure(figsize=(12, 7))
+                
+                # Plot training loss
+                if 'train.losses.total_loss' in df_grouped.columns:
+                    train_loss = df_grouped['train.losses.total_loss'].dropna()
+                    if len(train_loss) > 0:
+                        epochs = df_grouped.loc[train_loss.index, 'epoch'].values
+                        plt.plot(epochs, train_loss.values, 
+                                label='Training Loss', linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
+                        print(f"[PLOT] Training losses plotted: {len(train_loss)} epochs")
+                
+                # Plot validation loss
+                if 'validation.losses.total_loss' in df_grouped.columns:
+                    val_loss = df_grouped['validation.losses.total_loss'].dropna()
+                    if len(val_loss) > 0:
+                        epochs = df_grouped.loc[val_loss.index, 'epoch'].values
+                        plt.plot(epochs, val_loss.values, 
+                                label='Validation Loss', linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
+                        print(f"[PLOT] Validation losses plotted: {len(val_loss)} epochs")
+                
+                plt.xlabel('Epoch', fontsize=12)
+                plt.ylabel('Loss', fontsize=12)
+                plt.title(f'Loss Curves (Updated at Epoch {current_epoch})', fontsize=14)
+                plt.legend(fontsize=11, loc='best')
+                plt.grid(True, alpha=0.3)
+                
+                plot_path = os.path.join(log_dir, "loss_curves_realtime.png")
+                plt.savefig(plot_path, dpi=120, bbox_inches='tight')
+                plt.close()
+                print(f"[PLOT] Saved plot to {plot_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to create realtime plot: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def make_training_elements():
     losses = {
-        "cls_loss": LossDefault(
+        "OS_cls_loss": LossDefault(
             pred=KEY_LOGITS,
             target=KEY_TARGET_F,
             callable=lambda pred, target: F.binary_cross_entropy_with_logits(pred, target.unsqueeze(1)),
@@ -295,7 +375,7 @@ def make_training_elements():
             pred="results:metrics.apply_thresh.cls_pred",
             target=KEY_TARGET
         )),
-        ("bss", MetricBSS(pred=KEY_PROB, target=KEY_TARGET)),
+        # ("bss", MetricBSS(pred=KEY_PROB, target=KEY_TARGET)),
     ])
     train_metrics = common_metrics.copy()
     validation_metrics = copy.deepcopy(common_metrics)
@@ -344,16 +424,6 @@ def build_dataloaders_from_ids(
         dropout_p=dropout_p,
     )
 
-
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset=train_dataset,
-        collate_fn=CollateDefault(),
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        worker_init_fn=worker_init_fn,
-    )
-
     val_dataset = OSDataset.dataset(
         data_dir_img=data_paths["img"],
         data_dir_seg=data_paths["seg"],
@@ -367,14 +437,25 @@ def build_dataloaders_from_ids(
         dropout_p=dropout_p,
     )
 
+    # Create DataLoaders with safe collate function
+    train_dataloader = torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        collate_fn=CollateDefault(),
+        num_workers=0,  # Start with 0 workers for stability
+        pin_memory=False,  # Disable for debugging
+        shuffle=True,
+        drop_last=False,
+    )
+
     val_dataloader = torch.utils.data.DataLoader(
         dataset=val_dataset,
         batch_size=batch_size,
         collate_fn=CollateDefault(),
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        worker_init_fn=worker_init_fn,
+        num_workers=0,
+        pin_memory=False,
+        shuffle=False,
+        drop_last=False,
     )
 
     return train_dataloader, val_dataloader
@@ -390,18 +471,19 @@ def suggest_hyperparameters(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Di
     """
     cfg = copy.deepcopy(base_cfg)
     
-    # Patch size
+    # Patch size - use string representation to avoid Optuna warnings
     patch_size_options = [
-        (12, 48, 48),
-        (8, 64, 64),
-        (16, 32, 32),
-        (16, 64, 64)
+        "12x48x48",  # String representation
+        "16x32x32",
+        "16x64x64"
     ]
-    patch_size_choice = trial.suggest_categorical("patch_size", patch_size_options)
-    cfg["patch_size"] = patch_size_choice
+    patch_size_str = trial.suggest_categorical("patch_size", patch_size_options)
+    
+    # Convert string back to tuple
+    cfg["patch_size"] = tuple(map(int, patch_size_str.split('x')))
     
     # Embedding dimension
-    cfg["emb_dim"] = trial.suggest_categorical("emb_dim", [64, 128, 256])
+    cfg["emb_dim"] = trial.suggest_categorical("emb_dim", [64, 128])
     
     # Learning rate and weight decay
     cfg["lr"] = trial.suggest_float("lr", 3e-5, 5e-4, log=True)
@@ -412,11 +494,15 @@ def suggest_hyperparameters(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Di
     cfg["heads_b"] = trial.suggest_categorical("heads_b", [4, 8])
     
     # MLP layers
-    cfg["mlp_layers"] = trial.suggest_categorical("mlp_layers", ["single", "double"])
+    cfg["mlp_layers"] = trial.suggest_categorical("mlp_layers", ["double"])
     
     # Augmentation and masking
-    cfg["mask_pad_thresh"] = trial.suggest_categorical("mask_pad_thresh", [0.7, 0.8, 0.9])
-    cfg["imaging_aug_deg"] = trial.suggest_categorical("imaging_aug_deg", [0, 10, 20])
+    cfg["mask_pad_thresh"] = trial.suggest_categorical("mask_pad_thresh", [0.7])
+    cfg["imaging_aug_deg"] = trial.suggest_categorical("imaging_aug_deg", [0])
+    
+    # DataLoader parameters (add these if not in base_cfg)
+    cfg["batch_size"] = trial.suggest_categorical("batch_size", [2, 4, 8])
+    cfg["num_workers"] = 0  # Keep at 0 for stability
     
     return cfg
 
@@ -485,12 +571,13 @@ def train_one_trial(
 
     early_stop_cb = EarlyStopping(
         monitor="validation.metrics.auc",
-        patience=10,
+        patience=3, # for test
         mode="max",
         verbose=True
     )
     csv_logger = CSVLogger(save_dir=run_dir, name=".")
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    loss_plot_cb = SimpleLossPlotCallback(save_every_n_epochs=1)
 
     pl_module = LightningModuleDefault(
         model_dir=run_dir,
@@ -504,41 +591,60 @@ def train_one_trial(
 
     trainer = pl.Trainer(
         default_root_dir=run_dir,
-        max_epochs=100,
-        accelerator="gpu",
+        max_epochs=10, # for test
+        accelerator="auto",
         devices=1,
         logger=csv_logger,
-        log_every_n_steps=5,
+        log_every_n_steps=1,  # Disable step-level logging
+        enable_checkpointing=True,
         check_val_every_n_epoch=1,
-        callbacks=[early_stop_cb, checkpoint_cb, lr_monitor],
+        callbacks=[early_stop_cb, checkpoint_cb, lr_monitor, loss_plot_cb],
         gradient_clip_val=1.0,
         enable_progress_bar=True,
     )
 
     trainer.fit(pl_module, train_dl, val_dl)
 
-    # Flatten CSV logs into run_dir (metrics.csv)
+    # Replace the entire try-except block with:
     try:
         log_dir = csv_logger.log_dir
         src_metrics = os.path.join(log_dir, "metrics.csv")
         dst_metrics = os.path.join(run_dir, "metrics.csv")
+        
         if os.path.exists(src_metrics):
-            if os.path.exists(dst_metrics):
-                with open(dst_metrics, "a") as out_f, open(src_metrics, "r") as in_f:
-                    lines = in_f.readlines()
-                    start = 1 if lines and lines[0].lower().startswith("step") else 0
-                    out_f.writelines(lines[start:])
+            # Read and clean the CSV
+            df = pd.read_csv(src_metrics)
+            
+            # Keep only epoch-based rows (where epoch is not NaN)
+            df_clean = df.dropna(subset=['epoch']).copy()
+            
+            # If we have epoch data, save cleaned version
+            if len(df_clean) > 0:
+                # Take only the last step of each epoch to avoid duplicates
+                df_clean = df_clean.groupby('epoch').last().reset_index()
+                df_clean.to_csv(dst_metrics, index=False)
+                print(f"[INFO] Saved cleaned metrics with {len(df_clean)} epochs to {dst_metrics}")
             else:
-                shutil.move(src_metrics, dst_metrics)
-        src_hparams = os.path.join(log_dir, "hparams.yaml")
-        if os.path.exists(src_hparams):
-            shutil.move(src_hparams, os.path.join(run_dir, "hparams.yaml"))
+                # If no epoch data, just copy as-is
+                shutil.copy2(src_metrics, dst_metrics)
+            
+            # Save a separate CSV with all steps (for debugging)
+            df.to_csv(os.path.join(run_dir, "metrics_all_steps.csv"), index=False)
+
+            # copy the loss curves plot
+            src_plot = os.path.join(log_dir, "loss_curves_realtime.png")
+            dst_plot = os.path.join(run_dir, "loss_curves.png")
+            if os.path.exists(src_plot):
+                shutil.copy2(src_plot, dst_plot)
+        
+        # Clean up log directory
         try:
             shutil.rmtree(log_dir)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Could not remove log directory {log_dir}: {e}")
+            
     except Exception as e:
-        print(f"[WARN] Failed to flatten logs for {run_dir}: {e}")
+        print(f"[WARN] Failed to process logs for {run_dir}: {e}")
 
     # Determine best validation AUC from metrics.csv
     val_auc = 0.0
@@ -773,9 +879,10 @@ def parse_arguments():
                        help='Number of trials for Optuna optimization')
     parser.add_argument('--random_seed', type=int, default=42,
                        help='Random seed for reproducibility')
-    parser.add_argument('--n_fold', type=int, default=0, help='The fold to validate on')
+    parser.add_argument('--n_fold', type=int, default=1, help='The fold to validate on')
     parser.add_argument('--split_file', type=str, default=None,
                        help='Optional path to CSV file with predefined splits')
+
 
     
     return parser.parse_args()
@@ -821,6 +928,7 @@ def load_predefined_splits(split_file_path):
 
 def main():
     args = parse_arguments()
+
     
     GLOBAL_SEED = args.random_seed
     seed_everything(GLOBAL_SEED)
@@ -838,7 +946,7 @@ def main():
 
     # Base configuration
     base_cfg = {
-        "patch_size": (8, 64, 64),
+        "patch_size": (16, 64, 64),
         "emb_dim": 64,
         "lr": 1e-4,
         "wd": 1e-3,
@@ -848,13 +956,17 @@ def main():
         "depth_b": 2, "heads_b": 4,
         "depth_cross_attn": 2, "heads_cross": 2,
         "mlp_layers": "single",
-        "mask_pad_thresh": 0.8,
+        "mask_pad_thresh": 0.7,
         "clinical_aug": 0.0,
-        "imaging_aug_deg": 10,
+        "imaging_aug_deg": 0,
     }
 
     runs_root = os.path.join(os.getcwd(), RUNS_DIR_NAME)
     ensure_dir(runs_root)
+    runs_root = os.path.join(runs_root, f"{args.modality}", f"{args.n_fold}")
+    ensure_dir(runs_root)
+
+    
 
     # Load or create CV splits
     cv_splits = load_predefined_splits(
@@ -937,8 +1049,8 @@ def main():
                 cfg=cfg,
                 data_paths=data_paths,
                 largest_tumor=largest_tumor,
-                train_ids=inner_train_ids,
-                val_ids=inner_val_ids,
+                train_ids=inner_train_ids[:10], # for test
+                val_ids=inner_val_ids[:5], # for test
                 seed=GLOBAL_SEED + fold_idx * 100 + inner_fold_idx,
             )
             
@@ -979,7 +1091,7 @@ def main():
             print(f"  Train IDs: {len(train_ids)}, Test IDs: {len(val_ids)}")
             
             # Run 5-fold inner CV on training data
-            mean_inner_auc, inner_pred_rows = run_inner_cv(
+            mean_inner_auc = run_inner_cv(
                 cfg=cfg,
                 train_ids=train_ids,
                 val_ids=val_ids,
