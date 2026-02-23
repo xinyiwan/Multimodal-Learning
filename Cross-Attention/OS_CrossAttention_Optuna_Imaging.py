@@ -1001,7 +1001,7 @@ def evaluate_best_trial_on_test(
             fold_auc = float(roc_auc_score(fold_pred_df["y_true"], fold_pred_df["y_prob"]))
         print(
             f"[TEST EVAL] Inner fold {inner_fold_idx}: "
-            f"n={len(fold_probs)}, AUC={fold_auc:.4f if fold_auc is not None else 'N/A'}"
+            f"n={len(fold_probs)}, AUC={f'{fold_auc:.4f}' if fold_auc is not None else 'N/A'}"
         )
 
         # Accumulate probabilities for ensemble
