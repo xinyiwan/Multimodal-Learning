@@ -53,13 +53,12 @@ from fuse.data.utils.samplers import BatchSamplerDefault
 from OS import OSDataset
 from HeadMLPClassifier import HeadMLPClassifier
 from x_transformers import Encoder, TransformerWrapper
-from OSHelper import plot_loss_curves
 
 # =============================
 # Global constants
 # =============================
 
-RUNS_DIR_NAME = "runs_optuna_os_imaging"
+RUNS_DIR_NAME = "runs_optuna_OS"
 
 OPTUNA_STUDY_NAME = "os_imaging_optuna"
 
@@ -352,65 +351,6 @@ class SimpleLossPlotCallback(Callback):
             import traceback
             traceback.print_exc()
 
-def create_simple_realtime_plot(log_dir: str, current_epoch: int):
-    """Create a simple plot during training - plots all epochs up to current"""
-    try:
-        metrics_path = os.path.join(log_dir, "metrics.csv")
-        if os.path.exists(metrics_path):
-            df = pd.read_csv(metrics_path)
-            
-            
-            if len(df) > 0:
-                # Filter to current epoch and earlier to ensure we have complete data
-                df = df[df['epoch'] <= current_epoch].copy()
-                
-                # Aggregate each loss column independently after dropping its own NaNs.
-                # The last row per epoch is the validation row (NaN for train loss), so
-                # a combined groupby().agg('last') would zero-out training loss every epoch.
-                train_grouped = (
-                    df.dropna(subset=['train.losses.total_loss'])
-                    .groupby('epoch')['train.losses.total_loss']
-                    .mean()
-                    .reset_index()
-                )
-                val_grouped = (
-                    df.dropna(subset=['validation.losses.total_loss'])
-                    .groupby('epoch')['validation.losses.total_loss']
-                    .last()
-                    .reset_index()
-                )
-
-                print(f"[PLOT] Creating loss plot — train epochs: {len(train_grouped)}, val epochs: {len(val_grouped)} (current: {current_epoch})")
-
-                plt.figure(figsize=(12, 7))
-
-                # Plot training loss
-                if len(train_grouped) > 0:
-                    plt.plot(train_grouped['epoch'], train_grouped['train.losses.total_loss'],
-                            label='Training Loss', linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
-                    print(f"[PLOT] Training losses plotted: {len(train_grouped)} epochs")
-
-                # Plot validation loss
-                if len(val_grouped) > 0:
-                    plt.plot(val_grouped['epoch'], val_grouped['validation.losses.total_loss'],
-                            label='Validation Loss', linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
-                    print(f"[PLOT] Validation losses plotted: {len(val_grouped)} epochs")
-                
-                plt.xlabel('Epoch', fontsize=12)
-                plt.ylabel('Loss', fontsize=12)
-                plt.title(f'Loss Curves (Updated at Epoch {current_epoch})', fontsize=14)
-                plt.legend(fontsize=11, loc='best')
-                plt.grid(True, alpha=0.3)
-                
-                plot_path = os.path.join(log_dir, "loss_curves_realtime.png")
-                plt.savefig(plot_path, dpi=120, bbox_inches='tight')
-                plt.close()
-                print(f"[PLOT] Saved plot to {plot_path}")
-    except Exception as e:
-        print(f"[WARN] Failed to create realtime plot: {e}")
-        import traceback
-        traceback.print_exc()
-
 
 def make_training_elements():
     losses = {
@@ -556,12 +496,11 @@ def suggest_hyperparameters(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Di
     cfg["mlp_layers"] = trial.suggest_categorical("mlp_layers", ["double"])
     
     # Augmentation and masking
-    cfg["mask_pad_thresh"] = trial.suggest_categorical("mask_pad_thresh", [0.7])
-    cfg["imaging_aug_deg"] = trial.suggest_categorical("imaging_aug_deg", [0])
+    cfg["mask_pad_thresh"] = trial.suggest_categorical("mask_pad_thresh", [0.7, 0.8])
+    cfg["imaging_aug_deg"] = trial.suggest_categorical("imaging_aug_deg", [0, 10, 20])
     
     # DataLoader parameters (add these if not in base_cfg)
-    cfg["batch_size"] = trial.suggest_categorical("batch_size", [2, 4, 8])
-    cfg["num_workers"] = 0  # Keep at 0 for stability
+    cfg["num_workers"] = 10  # Keep at 0 for stability
     
     return cfg
 
@@ -630,7 +569,7 @@ def train_one_trial(
 
     early_stop_cb = EarlyStopping(
         monitor="validation.metrics.auc",
-        patience=3, # for test
+        patience=5, 
         mode="max",
         verbose=True
     )
@@ -650,7 +589,7 @@ def train_one_trial(
 
     trainer = pl.Trainer(
         default_root_dir=run_dir,
-        max_epochs=10, # for test
+        max_epochs=100, 
         accelerator="auto",
         devices=1,
         logger=csv_logger,
@@ -938,7 +877,7 @@ def parse_arguments():
                        help='Number of trials for Optuna optimization')
     parser.add_argument('--random_seed', type=int, default=42,
                        help='Random seed for reproducibility')
-    parser.add_argument('--n_fold', type=int, default=1, help='The fold to validate on')
+    parser.add_argument('--n_fold', type=int, default=0, help='The fold to validate on')
     parser.add_argument('--split_file', type=str, default=None,
                        help='Optional path to CSV file with predefined splits')
 
@@ -986,6 +925,7 @@ def load_predefined_splits(split_file_path):
 # =============================
 
 def main():
+    torch.set_float32_matmul_precision('high')
     args = parse_arguments()
 
     
@@ -1108,8 +1048,8 @@ def main():
                 cfg=cfg,
                 data_paths=data_paths,
                 largest_tumor=largest_tumor,
-                train_ids=inner_train_ids[:10], # for test
-                val_ids=inner_val_ids[:5], # for test
+                train_ids=inner_train_ids, 
+                val_ids=inner_val_ids, 
                 seed=GLOBAL_SEED + fold_idx * 100 + inner_fold_idx,
             )
             
