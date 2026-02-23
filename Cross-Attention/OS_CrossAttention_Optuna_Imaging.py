@@ -1042,7 +1042,7 @@ def evaluate_best_trial_on_test(
         )
     print(
         f"[TEST EVAL] Ensemble ({sum(1 for r in fold_results if r['status'] == 'ok')} models): "
-        f"n={len(df_ensemble)}, AUC={ensemble_auc:.4f if ensemble_auc is not None else 'N/A'}"
+        f"n={len(df_ensemble)}, AUC={f'{ensemble_auc:.4f}' if ensemble_auc is not None else 'N/A'}"
     )
 
     result: Dict[str, Any] = {
