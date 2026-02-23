@@ -505,6 +505,25 @@ def suggest_hyperparameters(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Di
     return cfg
 
 
+def reconstruct_cfg_from_params(params: Dict[str, Any], base_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Rebuild a full config dict from a completed Optuna trial's params dict.
+    Keys not in params fall back to base_cfg values.
+    """
+    cfg = copy.deepcopy(base_cfg)
+    param_map = {
+        "emb_dim", "lr", "wd", "depth_b", "heads_b",
+        "mlp_layers", "mask_pad_thresh", "imaging_aug_deg",
+    }
+    for key in param_map:
+        if key in params:
+            cfg[key] = params[key]
+    if "patch_size" in params:
+        cfg["patch_size"] = tuple(map(int, params["patch_size"].split("x")))
+    cfg["num_workers"] = 10
+    return cfg
+
+
 # =============================
 # Training a single trial
 # =============================
@@ -865,6 +884,187 @@ def evaluate_fold_best_epoch(
 
 
 # =============================
+# Test-set evaluation using ensemble of best-trial inner-fold models
+# =============================
+
+def evaluate_best_trial_on_test(
+    best_trial: optuna.Trial,
+    cfg_best: Dict[str, Any],
+    runs_root: str,
+    fold_idx: int,
+    val_ids: List[str],
+    data_paths: Dict[str, str],
+    largest_tumor: Tuple[int, int, int],
+    n_inner_folds: int = 5,
+) -> Dict[str, Any]:
+    """
+    Load the n_inner_folds models saved during the best Optuna trial and evaluate
+    them on the held-out test set (val_ids).
+
+    For each inner-fold model:
+      - Run inference on val_ids
+      - Save per-sample predictions to test_preds_inner_fold_{k}.csv
+
+    Ensemble step:
+      - Average probabilities across all available models
+      - Save to test_preds_ensemble.csv
+      - Compute AUC
+
+    Returns a summary dict (also written to test_eval_result.json).
+    """
+    trial_run_dir = os.path.join(runs_root, f"trial{best_trial.number:03d}_fold{fold_idx}")
+    slug = config_slug(cfg_best)
+    device = torch.device("cpu")
+
+    # sample_id -> list of probabilities (one per inner-fold model)
+    sample_probs: Dict[str, List[float]] = {}
+    sample_labels: Dict[str, int] = {}
+    fold_results: List[Dict[str, Any]] = []
+
+    for inner_fold_idx in range(n_inner_folds):
+        inner_fold_run_dir = os.path.join(trial_run_dir, f"inner_fold_{inner_fold_idx}")
+        best_ckpt_path = os.path.join(inner_fold_run_dir, "best_epoch.ckpt")
+
+        if not os.path.exists(best_ckpt_path):
+            print(f"[TEST EVAL] Missing checkpoint for inner fold {inner_fold_idx}: {best_ckpt_path}")
+            fold_results.append({"inner_fold_idx": inner_fold_idx, "status": "missing_ckpt"})
+            continue
+
+        model = load_model_from_checkpoint(
+            cfg=cfg_best,
+            ckpt_path=best_ckpt_path,
+            largest_tumor=largest_tumor,
+            device=device,
+        )
+
+        test_dataset = OSDataset.dataset(
+            data_dir_img=data_paths["img"],
+            data_dir_seg=data_paths["seg"],
+            clinical_csv_path=data_paths["csv"],
+            train=False,
+            sample_ids=val_ids,
+            patch_size=cfg_best["patch_size"],
+            largest_tumor=largest_tumor,
+            angle_range=(-cfg_best["imaging_aug_deg"], cfg_best["imaging_aug_deg"]),
+            mask_pad_threshold=cfg_best["mask_pad_thresh"],
+            dropout_p=cfg_best["clinical_aug"],
+        )
+
+        test_dataloader = torch.utils.data.DataLoader(
+            dataset=test_dataset,
+            batch_size=cfg_best["batch_size"],
+            collate_fn=CollateDefault(),
+            num_workers=0,
+            pin_memory=False,
+            shuffle=False,
+        )
+
+        fold_probs: Dict[str, float] = {}
+        fold_labels: Dict[str, int] = {}
+
+        with torch.no_grad():
+            for batch in test_dataloader:
+                batch_out = model(batch)
+                probs = batch_out[KEY_PROB].detach().cpu().view(-1)
+                labels = batch_out[KEY_TARGET].detach().cpu().view(-1)
+                sids = batch_out[KEY_SAMPLE_ID]
+
+                sids_list = (
+                    [str(s) for s in sids.cpu().tolist()]
+                    if isinstance(sids, torch.Tensor)
+                    else list(sids)
+                )
+
+                for i, sid in enumerate(sids_list):
+                    fold_probs[sid] = float(probs[i].item())
+                    fold_labels[sid] = int(labels[i].item())
+
+        # Save this fold's predictions
+        fold_pred_rows = [
+            {
+                "sample_id": sid,
+                "y_true": fold_labels[sid],
+                "y_prob": fold_probs[sid],
+                "inner_fold_idx": inner_fold_idx,
+            }
+            for sid in fold_probs
+        ]
+        fold_pred_df = pd.DataFrame(fold_pred_rows)
+        fold_pred_path = os.path.join(
+            trial_run_dir, f"test_preds_inner_fold_{inner_fold_idx}.csv"
+        )
+        fold_pred_df.to_csv(fold_pred_path, index=False)
+
+        # Compute individual fold AUC
+        fold_auc = None
+        if fold_pred_df["y_true"].nunique() >= 2:
+            fold_auc = float(roc_auc_score(fold_pred_df["y_true"], fold_pred_df["y_prob"]))
+        print(
+            f"[TEST EVAL] Inner fold {inner_fold_idx}: "
+            f"n={len(fold_probs)}, AUC={fold_auc:.4f if fold_auc is not None else 'N/A'}"
+        )
+
+        # Accumulate probabilities for ensemble
+        for sid, prob in fold_probs.items():
+            sample_probs.setdefault(sid, []).append(prob)
+        sample_labels.update(fold_labels)
+
+        fold_results.append(
+            {
+                "inner_fold_idx": inner_fold_idx,
+                "status": "ok",
+                "n_test_samples": len(fold_probs),
+                "test_auc": fold_auc,
+                "pred_csv": fold_pred_path,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Ensemble: average probabilities across inner-fold models
+    # ------------------------------------------------------------------
+    ensemble_rows = [
+        {
+            "sample_id": sid,
+            "y_true": sample_labels[sid],
+            "y_prob_ensemble": float(np.mean(sample_probs[sid])),
+            "n_models": len(sample_probs[sid]),
+        }
+        for sid in sample_probs
+    ]
+    df_ensemble = pd.DataFrame(ensemble_rows)
+    ensemble_pred_path = os.path.join(trial_run_dir, "test_preds_ensemble.csv")
+    df_ensemble.to_csv(ensemble_pred_path, index=False)
+
+    ensemble_auc = None
+    if len(df_ensemble) > 0 and df_ensemble["y_true"].nunique() >= 2:
+        ensemble_auc = float(
+            roc_auc_score(df_ensemble["y_true"], df_ensemble["y_prob_ensemble"])
+        )
+    print(
+        f"[TEST EVAL] Ensemble ({sum(1 for r in fold_results if r['status'] == 'ok')} models): "
+        f"n={len(df_ensemble)}, AUC={ensemble_auc:.4f if ensemble_auc is not None else 'N/A'}"
+    )
+
+    result: Dict[str, Any] = {
+        "best_trial_number": best_trial.number,
+        "fold_idx": fold_idx,
+        "config_slug": slug,
+        "n_inner_folds_used": sum(1 for r in fold_results if r["status"] == "ok"),
+        "fold_results": fold_results,
+        "ensemble_pred_csv": ensemble_pred_path,
+        "test_auc_ensemble": ensemble_auc,
+        "n_test_samples": len(df_ensemble),
+    }
+
+    result_path = os.path.join(trial_run_dir, "test_eval_result.json")
+    with open(result_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"[TEST EVAL] Results saved to {result_path}")
+
+    return result
+
+
+# =============================
 # Parse arguments (similar to main_tuning.py)
 # =============================
 
@@ -982,6 +1182,17 @@ def main():
         storage=f"sqlite:///{db_path}",
         load_if_exists=True
     )
+
+    # Stable directory that always holds the latest best-trial test predictions.
+    # Overwritten whenever a new best trial is found during optimization.
+    current_best_preds_dir = os.path.join(runs_root, "current_best_test_preds")
+
+    # Mutable tracker so the objective closure can update it across calls.
+    best_tracker: Dict[str, Any] = {
+        "score": -1.0,
+        "trial_number": -1,
+        "test_auc_ensemble": None,
+    }
 
     # Define inner CV function
     def run_inner_cv(cfg: Dict[str, Any], 
@@ -1169,6 +1380,76 @@ def main():
         trial.set_user_attr("AUC_dev", AUC_dev)
         # trial.set_user_attr("mean_val_auc", mean_val_auc)
 
+        # ------------------------------------------------------------------
+        # If this trial is a new best, evaluate immediately on the test set
+        # and update the stable "current_best_test_preds" directory.
+        # ------------------------------------------------------------------
+        if score > best_tracker["score"]:
+            best_tracker["score"] = score
+            best_tracker["trial_number"] = trial.number
+
+            print(
+                f"\n[BEST TRIAL UPDATE] Trial {trial.number} is new best "
+                f"(AUC_dev={score:.4f}). Running test-set evaluation ..."
+            )
+
+            test_eval = evaluate_best_trial_on_test(
+                best_trial=trial,
+                cfg_best=cfg,
+                runs_root=runs_root,
+                fold_idx=fold_idx,
+                val_ids=val_ids,
+                data_paths=data_paths,
+                largest_tumor=largest_tumor,
+                n_inner_folds=5,
+            )
+            best_tracker["test_auc_ensemble"] = test_eval["test_auc_ensemble"]
+
+            # Copy predictions to the stable "current best" location,
+            # overwriting whatever was there from a previous best trial.
+            ensure_dir(current_best_preds_dir)
+            trial_run_dir_best = os.path.join(
+                runs_root, f"trial{trial.number:03d}_fold{fold_idx}"
+            )
+
+            ensemble_src = os.path.join(trial_run_dir_best, "test_preds_ensemble.csv")
+            if os.path.exists(ensemble_src):
+                shutil.copy2(
+                    ensemble_src,
+                    os.path.join(current_best_preds_dir, "test_preds_ensemble.csv"),
+                )
+
+            for k in range(5):
+                fold_src = os.path.join(
+                    trial_run_dir_best, f"test_preds_inner_fold_{k}.csv"
+                )
+                if os.path.exists(fold_src):
+                    shutil.copy2(
+                        fold_src,
+                        os.path.join(
+                            current_best_preds_dir, f"test_preds_inner_fold_{k}.csv"
+                        ),
+                    )
+
+            with open(
+                os.path.join(current_best_preds_dir, "best_trial_info.json"), "w"
+            ) as f:
+                json.dump(
+                    {
+                        "trial_number": trial.number,
+                        "AUC_dev": score,
+                        "test_auc_ensemble": test_eval["test_auc_ensemble"],
+                        "n_test_samples": test_eval["n_test_samples"],
+                    },
+                    f,
+                    indent=2,
+                )
+
+            print(
+                f"[BEST TRIAL UPDATE] Test ensemble AUC={test_eval['test_auc_ensemble']}, "
+                f"predictions saved to {current_best_preds_dir}"
+            )
+
         return score
 
     # Run optimization
@@ -1180,17 +1461,25 @@ def main():
     print(f"[OPTUNA] Best trial: {study.best_trial.number}")
     print(f"[OPTUNA] Best value (score): {study.best_trial.value:.4f}")
     print(f"[OPTUNA] Best hyperparameters: {study.best_trial.params}")
-    
-    # Save best trial info
+
+    # Save best trial info (test evaluation was already run during optimization)
+    best_trial = study.best_trial
     best_info_path = os.path.join(runs_root, "best_trial.json")
     with open(best_info_path, "w") as f:
         json.dump({
-            "trial_number": study.best_trial.number,
-            "best_value": study.best_trial.value,
-            "best_params": study.best_trial.params,
-            "best_attributes": study.best_trial.user_attrs,
+            "trial_number": best_trial.number,
+            "best_value": best_trial.value,
+            "best_params": best_trial.params,
+            "best_attributes": best_trial.user_attrs,
+            "test_auc_ensemble": best_tracker["test_auc_ensemble"],
+            "current_best_preds_dir": current_best_preds_dir,
         }, f, indent=2)
-    
+    print(
+        f"[TEST EVAL] Final best trial {best_trial.number}: "
+        f"AUC_dev={best_trial.value:.4f}, "
+        f"test_auc_ensemble={best_tracker['test_auc_ensemble']}"
+    )
+
     print(f"[OPTUNA] Results saved to {runs_root}")
 
 
