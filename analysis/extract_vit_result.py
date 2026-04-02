@@ -15,21 +15,22 @@ LABEL_DIS = '/projects/prjs1779/Osteosarcoma/exp_data/label_distributions_summar
 
 def combine_probabilities_by_subject(csv_path, threshold=0.5):
     """
-    Combine probabilities by matching image positions across inner folds.
-    Assumes images are in the same order within each inner_fold.
-    Expects columns: y_true, y_pred_ensemble, and optionally inner_fold/subject_id.
+    Combine image-level predictions to patient-level by averaging probabilities.
+    sample_id format: OS_000002_01 -> patient_id: OS_000002
+    Expects columns: sample_id, y_true, y_prob_ensemble, n_models.
     """
     try:
         df = pd.read_csv(csv_path)
 
-        # sample id are image level 
-        df['patient_id'] = df['sample_id'].apply(lambda x: x.split('_')[0])
-        # Group by patient_id and take mean of probabilities and majority vote for predictions
-        combined_df = df.groupby('patient_id').agg({
-            'y_true': 'first',  # Assuming all samples for a patient have the same label
-            'y_prob_ensemble': 'mean',  # Average probability across samples
-            'prediction': lambda x: 1 if x.sum() > len(x) / 2 else 0  # Majority vote
-        }).reset_index()
+        # sample_id is image-level: e.g. OS_000002_01 -> patient OS_000002
+        df['patient_id'] = df['sample_id'].apply(lambda x: '_'.join(x.split('_')[:2]))
+
+        combined_df = df.groupby('patient_id').agg(
+            y_true=('y_true', 'first'),
+            y_prob_ensemble=('y_prob_ensemble', 'mean'),
+        ).reset_index()
+
+        combined_df['prediction'] = (combined_df['y_prob_ensemble'] >= threshold).astype(int)
         return combined_df
     except Exception as e:
         print(f"Error combining probabilities by subject: {e}")
@@ -37,7 +38,7 @@ def combine_probabilities_by_subject(csv_path, threshold=0.5):
         
 def calculate_metrics(predictions_df):
     """Calculate metrics from subject-level predictions (y_true / y_pred_ensemble columns)."""
-    probs = predictions_df['y_pred_ensemble'].values
+    probs = predictions_df['y_prob_ensemble'].values
     labels = predictions_df['y_true'].values
 
     if len(np.unique(labels)) < 2:
@@ -204,7 +205,7 @@ def generate_roc_with_ci(res_path, modality, alpha=0.95, n_samples=20):
             continue
 
         if len(np.unique(df['y_true'])) == 2:
-            fpr, tpr, thresholds = roc_curve(df['y_true'].values, df['y_pred_ensemble'].values)
+            fpr, tpr, thresholds = roc_curve(df['y_true'].values, df['y_prob_ensemble'].values)
             all_fpr.append(fpr)
             all_tpr.append(tpr)
             all_thresholds.append(thresholds)
