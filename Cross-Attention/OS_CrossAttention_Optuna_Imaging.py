@@ -1160,7 +1160,8 @@ def main():
         "imaging_aug_deg": 0,
     }
 
-    runs_root = os.path.join(os.getcwd(), RUNS_DIR_NAME)
+    SCRATCH_DIR_NAME = "/scratch-shared/xwan1"
+    runs_root = os.path.join(SCRATCH_DIR_NAME, RUNS_DIR_NAME)
     ensure_dir(runs_root)
     runs_root = os.path.join(runs_root, f"{args.modality}", f"{args.n_fold}")
     ensure_dir(runs_root)
@@ -1290,6 +1291,10 @@ def main():
             
             if fold_idx != args.n_fold:
                 continue
+            # Remove 'OS_000085_02' from splits if present
+            split['train'] = [sid for sid in split['train'] if sid != 'OS_000085_02']
+            split['test'] = [sid for sid in split['test'] if sid != 'OS_000085_02'] 
+            
             train_ids = split['train']
             val_ids = split['test']
             fold_run_dir = os.path.join(
@@ -1303,8 +1308,8 @@ def main():
             # Run 5-fold inner CV on training data
             mean_inner_auc = run_inner_cv(
                 cfg=cfg,
-                train_ids=train_ids,
-                val_ids=val_ids,
+                train_ids=train_ids, 
+                val_ids=val_ids, 
                 fold_idx=fold_idx,
                 trial=trial,
                 run_dir_base=fold_run_dir,
@@ -1397,7 +1402,7 @@ def main():
                 best_trial=trial,
                 cfg_best=cfg,
                 runs_root=runs_root,
-                fold_idx=fold_idx,
+                fold_idx=args.n_fold,
                 val_ids=val_ids,
                 data_paths=data_paths,
                 largest_tumor=largest_tumor,
@@ -1409,7 +1414,7 @@ def main():
             # overwriting whatever was there from a previous best trial.
             ensure_dir(current_best_preds_dir)
             trial_run_dir_best = os.path.join(
-                runs_root, f"trial{trial.number:03d}_fold{fold_idx}"
+                runs_root, f"trial{trial.number:03d}_fold{args.n_fold}"
             )
 
             ensemble_src = os.path.join(trial_run_dir_best, "test_preds_ensemble.csv")
