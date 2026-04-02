@@ -27,7 +27,7 @@ def combine_probabilities_by_subject(csv_path, threshold=0.5):
         # Group by patient_id and take mean of probabilities and majority vote for predictions
         combined_df = df.groupby('patient_id').agg({
             'y_true': 'first',  # Assuming all samples for a patient have the same label
-            'y_pred_ensemble': 'mean',  # Average probability across samples
+            'y_prob_ensemble': 'mean',  # Average probability across samples
             'prediction': lambda x: 1 if x.sum() > len(x) / 2 else 0  # Majority vote
         }).reset_index()
         return combined_df
@@ -35,8 +35,6 @@ def combine_probabilities_by_subject(csv_path, threshold=0.5):
         print(f"Error combining probabilities by subject: {e}")
         return None
         
-
-
 def calculate_metrics(predictions_df):
     """Calculate metrics from subject-level predictions (y_true / y_pred_ensemble columns)."""
     probs = predictions_df['y_pred_ensemble'].values
@@ -186,7 +184,7 @@ def generate_roc_with_ci(res_path, modality, alpha=0.95, n_samples=20):
     all_tpr = []
     all_thresholds = []
 
-    for fold in range(20):
+    for fold in range(5):
         fold_num = str(fold)
         fold_path = res_path / modality / fold_num
         best_trial_info = fold_path / "current_best_test_preds" / "best_trial_info.json"
@@ -295,7 +293,8 @@ def main(args):
                                   'tp', 'tn', 'fp', 'fn', 'fold']]
 
         # Save per-fold metrics CSV
-        out_dir = res_path / modality
+        res_save_path = '/projects/prjs1779/Osteosarcoma/OS_ViT_res'
+        out_dir = res_save_path / modality
         os.makedirs(out_dir, exist_ok=True)
         metrics_output = out_dir / "metrics_CI.csv"
         metrics_df.round(2).to_csv(metrics_output, index=False)
