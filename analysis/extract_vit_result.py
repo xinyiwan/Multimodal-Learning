@@ -99,8 +99,10 @@ def extract_from_one_fold(res_path, modality, fold_num):
         best_trial_num = best_trial_data.get("trial_number", {})
         best_trial_auc_dev = best_trial_data.get("AUC_dev", {})
         best_trial_auc_test = best_trial_data.get("test_auc_ensemble", {})
+    
+    best_trial_num = str(best_trial_num).zfill(3)
 
-    best_trial_path = fold_path / f"trial0{best_trial_num}_fold{fold_num}"
+    best_trial_path = fold_path / f"trial{best_trial_num}_fold{fold_num}"
     test_preds_ensemble = best_trial_path / "test_preds_ensemble.csv"
     if not test_preds_ensemble.exists():
         print(f"Warning: {test_preds_ensemble} does not exist. Skipping.")
@@ -196,7 +198,10 @@ def generate_roc_with_ci(res_path, modality, alpha=0.95, n_samples=20):
             best_trial_data = json.load(f)
             best_trial_num = best_trial_data.get("trial_number", {})
 
-        test_preds_ensemble = fold_path / f"trial0{best_trial_num}_fold{fold_num}" / "test_preds_ensemble.csv"
+            # best_trial_num into string with leading zeros (e.g. 1 -> "01")
+            best_trial_num = str(best_trial_num).zfill(3)
+
+        test_preds_ensemble = fold_path / f"trial{best_trial_num}_fold{fold_num}" / "test_preds_ensemble.csv"
         if not test_preds_ensemble.exists():
             continue
 
@@ -294,7 +299,7 @@ def main(args):
                                   'tp', 'tn', 'fp', 'fn', 'fold']]
 
         # Save per-fold metrics CSV
-        res_save_path = '/projects/prjs1779/Osteosarcoma/OS_ViT_res'
+        res_save_path = Path('/projects/prjs1779/Osteosarcoma/OS_ViT_res')
         out_dir = res_save_path / modality
         os.makedirs(out_dir, exist_ok=True)
         metrics_output = out_dir / "metrics_CI.csv"
