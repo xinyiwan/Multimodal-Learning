@@ -286,18 +286,24 @@ class SimpleLossPlotCallback(Callback):
         self.save_every_n_epochs = save_every_n_epochs
         self._train_losses: dict = {}  # epoch -> loss
         self._val_losses: dict = {}    # epoch -> loss
+        self._train_aucs: dict = {}    # epoch -> auc
+        self._val_aucs: dict = {}      # epoch -> auc
 
     def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         epoch = trainer.current_epoch
         metrics = trainer.callback_metrics
         if 'train.losses.total_loss' in metrics:
             self._train_losses[epoch] = float(metrics['train.losses.total_loss'])
+        if 'train.metrics.auc' in metrics:
+            self._train_aucs[epoch] = float(metrics['train.metrics.auc'])
 
     def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         epoch = trainer.current_epoch
         metrics = trainer.callback_metrics
         if 'validation.losses.total_loss' in metrics:
             self._val_losses[epoch] = float(metrics['validation.losses.total_loss'])
+        if 'validation.metrics.auc' in metrics:
+            self._val_aucs[epoch] = float(metrics['validation.metrics.auc'])
 
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         current_epoch = trainer.current_epoch
@@ -320,31 +326,51 @@ class SimpleLossPlotCallback(Callback):
 
     def _plot(self, log_dir: str, current_epoch: int) -> None:
         try:
-            plt.figure(figsize=(12, 7))
+            fig, (ax_loss, ax_auc) = plt.subplots(1, 2, figsize=(20, 7))
 
             if self._train_losses:
                 epochs = sorted(self._train_losses)
                 losses = [self._train_losses[e] for e in epochs]
-                plt.plot(epochs, losses, label='Training Loss',
-                         linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
+                ax_loss.plot(epochs, losses, label='Training Loss',
+                             linewidth=2.5, color='#1f77b4', marker='o', markersize=4)
                 print(f"[PLOT] Training losses plotted: {len(epochs)} epochs")
 
             if self._val_losses:
                 epochs = sorted(self._val_losses)
                 losses = [self._val_losses[e] for e in epochs]
-                plt.plot(epochs, losses, label='Validation Loss',
-                         linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
+                ax_loss.plot(epochs, losses, label='Validation Loss',
+                             linewidth=2.5, color='#ff7f0e', marker='s', markersize=4)
                 print(f"[PLOT] Validation losses plotted: {len(epochs)} epochs")
 
-            plt.xlabel('Epoch', fontsize=12)
-            plt.ylabel('Loss', fontsize=12)
-            plt.title(f'Loss Curves (Updated at Epoch {current_epoch})', fontsize=14)
-            plt.legend(fontsize=11, loc='best')
-            plt.grid(True, alpha=0.3)
+            ax_loss.set_xlabel('Epoch', fontsize=12)
+            ax_loss.set_ylabel('Loss', fontsize=12)
+            ax_loss.set_title(f'Loss Curves (Updated at Epoch {current_epoch})', fontsize=14)
+            ax_loss.legend(fontsize=11, loc='best')
+            ax_loss.grid(True, alpha=0.3)
+
+            if self._train_aucs:
+                epochs = sorted(self._train_aucs)
+                aucs = [self._train_aucs[e] for e in epochs]
+                ax_auc.plot(epochs, aucs, label='Training AUC',
+                            linewidth=2.5, color='#2ca02c', marker='o', markersize=4)
+                print(f"[PLOT] Training AUCs plotted: {len(epochs)} epochs")
+
+            if self._val_aucs:
+                epochs = sorted(self._val_aucs)
+                aucs = [self._val_aucs[e] for e in epochs]
+                ax_auc.plot(epochs, aucs, label='Validation AUC',
+                            linewidth=2.5, color='#d62728', marker='s', markersize=4)
+                print(f"[PLOT] Validation AUCs plotted: {len(epochs)} epochs")
+
+            ax_auc.set_xlabel('Epoch', fontsize=12)
+            ax_auc.set_ylabel('AUC', fontsize=12)
+            ax_auc.set_title(f'AUC Curves (Updated at Epoch {current_epoch})', fontsize=14)
+            ax_auc.legend(fontsize=11, loc='best')
+            ax_auc.grid(True, alpha=0.3)
 
             plot_path = os.path.join(log_dir, "loss_curves_realtime.png")
-            plt.savefig(plot_path, dpi=120, bbox_inches='tight')
-            plt.close()
+            fig.savefig(plot_path, dpi=120, bbox_inches='tight')
+            plt.close(fig)
             print(f"[PLOT] Saved plot to {plot_path}")
         except Exception as e:
             print(f"[WARN] Failed to create realtime plot: {e}")
